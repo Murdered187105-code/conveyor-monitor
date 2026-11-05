@@ -1,0 +1,6 @@
+opencv-python
+numpy
+mss
+pillow
+# необязательно (режим захвата DirectX):
+# dxcam
