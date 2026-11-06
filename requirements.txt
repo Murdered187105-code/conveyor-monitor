@@ -2,5 +2,6 @@ opencv-python
 numpy
 mss
 pillow
-# необязательно (режим захвата DirectX):
-# dxcam
+dxcam
+# чтение очков (большая: ставит PyTorch). v6 ставит её сам в фоне при первом запуске
+easyocr

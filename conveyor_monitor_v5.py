@@ -215,6 +215,16 @@ AUTOSAVE_MS = 60_000          # автосохранение раз в мину�
 SHIFT_LIMIT = 600             # предел шкалы сдвига, пикс
 LINE_COUNT = 12               # число линий
 
+# Цвета интерфейса. Главное окно v6 подменяет их на тёмную тему (THEME.update(...))
+# и задаёт STYLE_HOOK — функцию, которая настраивает стили ttk.
+THEME = {
+    "dark": False,
+    "text": "black", "muted": "#9ca3af", "accent": "#2563eb",
+    "list_bg": "white", "hl_bg": "#bbf7d0", "hl_fg": "black",
+    "bar_bg": "#f1f5f9", "bar_border": "#cbd5e1", "log_bg": "#f8fafc",
+}
+STYLE_HOOK = None
+
 SHAPES = ["Прямоугольник", "Круг (эллипс)", "Ромб", "Вертикальная полоса"]
 SHAPE_HINTS = [
     "вся выделенная область",
@@ -231,7 +241,10 @@ KEY_SCANCODES = {
     "f5": (0x3F, False), "f6": (0x40, False), "f7": (0x41, False), "f8": (0x42, False),
     "f9": (0x43, False), "f10": (0x44, False), "f11": (0x57, False), "f12": (0x58, False),
 }
-KEYS = list(KEY_SCANCODES.keys())
+# Кнопки мыши (устройства Interception 11..20): (флаг нажатия, флаг отпускания)
+MOUSE_BUTTONS = {"mouse_left": (0x001, 0x002), "mouse_right": (0x004, 0x008)}
+KEYS = list(KEY_SCANCODES.keys()) + list(MOUSE_BUTTONS.keys())
+VALID_KEYS = set(KEYS)
 
 
 def make_num_specs():
@@ -483,7 +496,16 @@ INTERCEPTION_KEY_E0 = 0x02
 INTERCEPTION_FILTER_KEY_ALL = 0xFFFF
 MAX_KEYBOARDS = 10   # устройства 1..10 — клавиатуры, 11..20 — мыши
 
+MAX_MICE = 10        # устройства 11..20
+
 _PREDICATE = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int)
+
+
+class IMouseStroke(ctypes.Structure):
+    # InterceptionMouseStroke: state, flags, rolling, x, y, information (20 байт)
+    _fields_ = [("state", ctypes.c_ushort), ("flags", ctypes.c_ushort),
+                ("rolling", ctypes.c_short), ("x", ctypes.c_int), ("y", ctypes.c_int),
+                ("information", ctypes.c_uint)]
 
 
 class InterceptionError(Exception):
@@ -569,6 +591,8 @@ class InterceptionKeySender:
         self.devices = []        # [(номер устройства 1..10, hardware id)]
         self.selected = 0        # 0 = автоопределение
         self.active_dev = 0      # последняя клавиатура, на которой нажатие прошло
+        self.active_mouse = 0    # последняя мышь, на которой клик прошёл
+        self._mice = None
         self.sent = 0
         self._io_lock = threading.Lock()
         self._req_lock = threading.Lock()
@@ -668,10 +692,58 @@ class InterceptionKeySender:
             return False
 
     # ---------------------------------------------------------------- нажатие
+    def _mouse_ids(self):
+        """Номера устройств-мышей (11..20), у которых есть hardware id."""
+        if self._mice is None:
+            found = []
+            buf = ctypes.create_string_buffer(512)
+            for dev in range(MAX_KEYBOARDS + 1, MAX_KEYBOARDS + MAX_MICE + 1):
+                try:
+                    n = int(self.lib.interception_get_hardware_id(self.ctx, dev, buf, 512))
+                except Exception:
+                    n = 0
+                if 0 < n <= 512:
+                    found.append(dev)
+            self._mice = found or list(range(MAX_KEYBOARDS + 1, MAX_KEYBOARDS + MAX_MICE + 1))
+        return self._mice
+
+    def _send_mouse(self, dev, state):
+        stroke = IMouseStroke()
+        stroke.state, stroke.flags, stroke.rolling = state, 0, 0   # flags 0: без движения
+        stroke.x = stroke.y = 0
+        stroke.information = 0
+        try:
+            with self._io_lock:
+                return self.lib.interception_send(self.ctx, dev, ctypes.byref(stroke), 1) > 0
+        except Exception:
+            return False
+
+    def click_sync(self, button, hold_ms, t_origin=None):
+        """Клик кнопкой мыши через Interception (в текущей точке курсора)."""
+        down, up = MOUSE_BUTTONS[button]
+        order = ([self.active_mouse] if self.active_mouse else []) + \
+            [d for d in self._mouse_ids() if d != self.active_mouse]
+        for dev in order:
+            if not self._send_mouse(dev, down):
+                continue
+            latency = (time.perf_counter() - t_origin) * 1000.0 if t_origin else 0.0
+            try:
+                if hold_ms > 0:
+                    time.sleep(hold_ms / 1000.0)
+            finally:
+                for _ in range(3):
+                    if self._send_mouse(dev, up):
+                        break
+            self.active_mouse = dev
+            return True, dev, latency, ""
+        return False, 0, 0.0, "драйвер не принял клик ни на одной мыши"
+
     def press_sync(self, key_name, hold_ms, t_origin=None):
         """Нажать и отпустить клавишу. Возвращает (успех, устройство, задержка_мс, ошибка)."""
         if not self.available:
             return False, 0, 0.0, self.error
+        if key_name in MOUSE_BUTTONS:
+            return self.click_sync(key_name, hold_ms, t_origin)
         code, extended = KEY_SCANCODES.get(key_name, KEY_SCANCODES["space"])
         flag = INTERCEPTION_KEY_E0 if extended else 0
         down, up = INTERCEPTION_KEY_DOWN | flag, INTERCEPTION_KEY_UP | flag
@@ -721,8 +793,9 @@ class InterceptionKeySender:
                 self.sent += 1
                 self.shared.set_stats(sent=self.sent, latency=lat)
                 what = note or f"заполнение {fill:.1f}%"
+                kind = "мышь" if key_name in MOUSE_BUTTONS else "клавиатура"
                 self.shared.log(f"СИГНАЛ «{key_name}» отправлен через Interception "
-                                f"(клавиатура {dev}): {what}, "
+                                f"({kind} {dev}): {what}, "
                                 f"задержка {lat:.1f} мс (№{self.sent})")
             else:
                 self.shared.log(f"Ошибка отправки «{key_name}»: {err}")
@@ -811,6 +884,7 @@ class Shared:
         self.stop = threading.Event()
         self.log_q = queue.Queue()
         self.reset_cycle = threading.Event()   # запрос "начать цикл линий заново"
+        self.paused = threading.Event()        # ручной режим приостановлен (работает ИИ)
         self._stats = {"fill": 0.0, "fps": 0.0, "triggered": False, "sent": 0,
                        "error": "", "black": False, "latency": 0.0,
                        "work": "zone", "active": 0, "pcts": [0.0] * 12, "cycles": 0,
@@ -1147,6 +1221,13 @@ class Worker(threading.Thread):
         prev_frame = None
 
         while not sh.stop.is_set():
+            if sh.paused.is_set():              # экран сейчас анализирует ИИ-автопилот
+                if backend is not None:
+                    backend.close()
+                    backend, backend_key = None, None
+                sh.set_stats(fps=0.0, error="", triggered=False)
+                sh.stop.wait(0.05)
+                continue
             p = sh.get_params()
             try:
                 work = p["work"]
@@ -1525,11 +1606,18 @@ class App:
                    "Координаты области считаются от левого верхнего угла этого окна."),
     }
 
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title(APP_TITLE)
-        self.root.geometry("1200x940")
-        self.root.minsize(1100, 780)
+    def __init__(self, root=None, container=None, show_title=True):
+        """root/container — для встраивания во вкладку главного окна v6.
+        Без параметров — отдельное окно, как раньше."""
+        self.standalone = root is None
+        self.root = root or tk.Tk()
+        self.container = container or self.root
+        self.show_title = show_title
+        self.is_visible = lambda: True   # v6 подменяет: видна ли вкладка ручного режима
+        if self.standalone:
+            self.root.title(APP_TITLE)
+            self.root.geometry("1200x940")
+            self.root.minsize(1100, 780)
         self._closing = False
         self._bulk = False          # пакетное изменение переменных (без лишних пересчётов)
         self._shift_busy = False    # шкала меняется программно (загрузка настроек)
@@ -1590,12 +1678,17 @@ class App:
         self.shared.log("Программа запущена. Отправка сигнала ВЫКЛЮЧЕНА — "
                         "настройте область и включите её кнопкой справа или клавишей F8.")
 
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        if self.standalone:
+            self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(30, self._tick)
         self.root.after(AUTOSAVE_MS, self._autosave)
 
     # ------------------------------------------------------------------ стиль
     def _setup_style(self):
+        if STYLE_HOOK is not None:          # v6: своя (тёмная) тема
+            STYLE_HOOK(self.root)
+            self._unbind_space()
+            return
         style = ttk.Style(self.root)
         try:
             style.theme_use("vista")
@@ -1609,6 +1702,9 @@ class App:
         style.configure("Hint.TLabel", font=("Segoe UI", 9), foreground="#6b7280")
         style.configure("Big.TButton", font=("Segoe UI", 11, "bold"), padding=8)
         style.configure("TNotebook.Tab", padding=(12, 6), font=("Segoe UI", 10, "bold"))
+        self._unbind_space()
+
+    def _unbind_space(self):
         # Пробел во время работы не должен "нажимать" кнопки интерфейса
         for cls in ("TButton", "TCheckbutton", "TRadiobutton"):
             try:
@@ -1642,7 +1738,7 @@ class App:
             mode = "mss"
         self.mode_var = tk.StringVar(self.root, value=mode)
         key = str(saved.get("key", "space"))
-        self.key_var = tk.StringVar(self.root, value=key if key in KEY_SCANCODES else "space")
+        self.key_var = tk.StringVar(self.root, value=key if key in VALID_KEYS else "space")
         try:
             self.kb_selected = max(0, min(MAX_KEYBOARDS, int(saved.get("kb_device", 0))))
         except (TypeError, ValueError):
@@ -1727,7 +1823,7 @@ class App:
 
     # -------------------------------------------------------------- построение
     def _build_ui(self):
-        root = self.root
+        root = self.container
         root.columnconfigure(0, weight=1)
         root.rowconfigure(2, weight=1)
 
@@ -1735,7 +1831,9 @@ class App:
         hdr = ttk.Frame(root, padding=(14, 10, 14, 0))
         hdr.grid(row=0, column=0, sticky="ew")
         hdr.columnconfigure(0, weight=1)
-        ttk.Label(hdr, text=APP_TITLE, style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(hdr, text=APP_TITLE if self.show_title else "Ручной режим: зона, 12 линий, "
+                  "шкала, очерёдность", style="Title.TLabel" if self.show_title
+                  else "Bold.TLabel").grid(row=0, column=0, sticky="w")
         self.badge = tk.Label(hdr, text="", font=("Segoe UI", 11, "bold"), fg="white",
                               bg="#6b7280", padx=14, pady=5)
         self.badge.grid(row=0, column=1, sticky="e")
@@ -1747,7 +1845,7 @@ class App:
         ttk.Label(bar_row, textvariable=self.fill_var, style="Bold.TLabel",
                   width=46).grid(row=0, column=0, sticky="w")
         self.bar = tk.Canvas(bar_row, height=24, highlightthickness=1,
-                             highlightbackground="#cbd5e1", bg="#f1f5f9")
+                             highlightbackground=THEME["bar_border"], bg=THEME["bar_bg"])
         self.bar.grid(row=0, column=1, sticky="ew", padx=8)
         self.stat_var = tk.StringVar(value="")
         ttk.Label(bar_row, textvariable=self.stat_var, style="Hint.TLabel",
@@ -2009,7 +2107,7 @@ class App:
         right.grid(row=1, column=1, sticky="nw", pady=(8, 0))
         self.shift_text = tk.StringVar()
         tk.Label(right, textvariable=self.shift_text, font=("Segoe UI", 20, "bold"),
-                 fg="#2563eb").pack(anchor="w")
+                 fg=THEME["accent"]).pack(anchor="w")
         ttk.Label(right, text="Все 12 линий (включая выключенные) сдвинуты по оси Y "
                               "на это значение.", style="Hint.TLabel").pack(anchor="w",
                                                                            pady=(0, 10))
@@ -2058,7 +2156,8 @@ class App:
         lb_holder.grid(row=0, column=0, sticky="ns")
         self.seq_lb = tk.Listbox(lb_holder, width=30, height=14, font=("Consolas", 11),
                                  activestyle="none", exportselection=False,
-                                 selectbackground="#2563eb", selectforeground="white")
+                                 selectbackground=THEME["accent"], selectforeground="white",
+                                 bg=THEME["list_bg"], fg=THEME["text"], highlightthickness=0)
         sb = ttk.Scrollbar(lb_holder, orient="vertical", command=self.seq_lb.yview)
         self.seq_lb.configure(yscrollcommand=sb.set)
         self.seq_lb.pack(side="left", fill="y")
@@ -2163,7 +2262,7 @@ class App:
             mark = "↻" if k == loop0 else " "
             off = "  (выкл)" if not enabled[line] else ""
             self.seq_lb.insert("end", f"{mark} Шаг {k + 1:>3}:  линия {line + 1:>2}{off}")
-            self.seq_lb.itemconfig(k, foreground="#9ca3af" if off else "black")
+            self.seq_lb.itemconfig(k, foreground=THEME["muted"] if off else THEME["text"])
         self.seq_lb.yview_moveto(top)
         if select is not None and n:
             select = min(max(select, 0), n - 1)
@@ -2256,9 +2355,9 @@ class App:
         old = self._seq_shown_step
         n = self.seq_lb.size()
         if old is not None and 0 <= old < n:
-            self.seq_lb.itemconfig(old, background="white")
+            self.seq_lb.itemconfig(old, background=THEME["list_bg"])
         if 0 <= step < n:
-            self.seq_lb.itemconfig(step, background="#bbf7d0")
+            self.seq_lb.itemconfig(step, background=THEME["hl_bg"])
             if self.nb.select() == str(self.seq_tab):
                 self.seq_lb.see(step)
         self._seq_shown_step = step
@@ -2377,7 +2476,8 @@ class App:
         log_frame = ttk.Frame(side)
         log_frame.pack(fill="both", expand=True)
         self.log_text = tk.Text(log_frame, width=38, height=8, wrap="word", state="disabled",
-                                font=("Consolas", 9), bg="#f8fafc", relief="solid", bd=1)
+                                font=("Consolas", 9), bg=THEME["log_bg"], fg=THEME["text"],
+                                insertbackground=THEME["text"], relief="flat", bd=1)
         sb = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -2399,6 +2499,8 @@ class App:
             self._bind_arrows(child)
 
     def _on_arrow(self, event, dx, dy):
+        if not self.is_visible():           # открыта другая вкладка главного окна
+            return None
         try:
             focus = self.root.focus_get()
             if focus is not None and focus.winfo_class() in (
@@ -2809,7 +2911,7 @@ class App:
         if mode in self.MODE_TEXT and not (mode == "dxcam" and dxcam is None):
             self.mode_var.set(mode)
         key = str(d.get("key", "space"))
-        self.key_var.set(key if key in KEY_SCANCODES else "space")
+        self.key_var.set(key if key in VALID_KEYS else "space")
         try:
             self.sender.selected = max(0, min(MAX_KEYBOARDS, int(d.get("kb_device", 0))))
         except (TypeError, ValueError):
@@ -3108,6 +3210,11 @@ class App:
 
     # ------------------------------------------------------------- выход
     def on_close(self):
+        self.shutdown()
+        self.root.destroy()
+
+    def shutdown(self):
+        """Сохранить настройки и остановить потоки (без закрытия окна)."""
         self._closing = True
         try:
             self._write_settings(SETTINGS_FILE)
@@ -3120,7 +3227,6 @@ class App:
             self._picker.finish(True)
         self.overlay.destroy()
         self.line_overlay.destroy()
-        self.root.destroy()
 
     def run(self):
         self.root.mainloop()

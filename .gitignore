@@ -1,5 +1,8 @@
 __pycache__/
 *.pyc
 config.json
+ai_config.json
+ai_database/
+_sim_db/
 *.tmp
 interception.dll
